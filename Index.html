@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<!--
+  QR ASSET SCANNER — standalone camera page
+
+  WHY THIS IS A SEPARATE FILE FROM THE APPS SCRIPT (Code.gs):
+  Google Apps Script serves its own web pages inside a sandboxed iframe on a
+  different Google domain. That sandbox blocks camera access even when your
+  browser shows camera permission as "allowed" for the script.google.com URL.
+  So the camera UI has to live on a normal website instead. This page just
+  talks to your Apps Script backend over the network (fetch/POST) — it
+  doesn't need to be hosted anywhere near it.
+
+  SETUP
+  1. Below, find APPS_SCRIPT_URL and paste in your deployed Apps Script
+     Web app URL (Extensions > Apps Script > Deploy > Manage deployments
+     > copy the URL ending in /exec).
+  2. Save this file.
+  3. Host it anywhere that gives you a public HTTPS link. Easiest free option
+     with no signup: go to https://app.netlify.com/drop and drag this file
+     onto the page — it instantly gives you a live link.
+  4. Open that link on any phone/tablet/laptop with a camera. That's your
+     scanner — bookmark it or turn it into a home-screen icon.
+-->
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Asset Scanner</title>
+<style>
+  :root {
+    --bg: #14171a;
+    --panel: #1c2126;
+    --line: #2a3138;
+    --amber: #f5a623;
+    --text: #e8eaed;
+    --text-dim: #8b939b;
+    --ok: #3ddc84;
+    --err: #ff5a5f;
+    --mono: 'IBM Plex Mono', 'Courier New', monospace;
+    --sans: 'Inter', -apple-system, 'Segoe UI', Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: var(--bg); color: var(--text);
+    font-family: var(--sans);
+    -webkit-tap-highlight-color: transparent;
+  }
+  body {
+    display: flex; flex-direction: column; align-items: center;
+    padding: 20px 16px 28px;
+    min-height: 100%;
+  }
+  .eyebrow {
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.18em;
+    color: var(--amber); text-transform: uppercase; margin-bottom: 4px;
+  }
+  h1 {
+    font-size: 20px; font-weight: 600; margin: 0 0 20px; letter-spacing: -0.01em;
+  }
+  .stage {
+    position: relative; width: 100%; max-width: 420px; aspect-ratio: 1 / 1;
+    background: #000; border-radius: 18px; overflow: hidden;
+    border: 1px solid var(--line);
+    box-shadow: 0 0 0 1px rgba(0,0,0,0.4), 0 20px 40px -20px rgba(0,0,0,0.6);
+  }
+  #reader { width: 100% !important; height: 100% !important; }
+  #reader video { width: 100% !important; height: 100% !important; object-fit: cover; }
+  #reader__scan_region { background: transparent !important; }
+  #reader__dashboard { display: none !important; }
+  #reader__scan_region img { display: none !important; }
+
+  .brackets { position: absolute; inset: 14%; pointer-events: none; }
+  .brackets span {
+    position: absolute; width: 28px; height: 28px;
+    border-color: var(--amber); opacity: 0.9;
+    transition: opacity 0.2s, border-color 0.2s;
+  }
+  .brackets.hit span { border-color: var(--ok); }
+  .brackets .tl { top: 0; left: 0; border-top: 3px solid; border-left: 3px solid; border-radius: 6px 0 0 0; }
+  .brackets .tr { top: 0; right: 0; border-top: 3px solid; border-right: 3px solid; border-radius: 0 6px 0 0; }
+  .brackets .bl { bottom: 0; left: 0; border-bottom: 3px solid; border-left: 3px solid; border-radius: 0 0 0 6px; }
+  .brackets .br { bottom: 0; right: 0; border-bottom: 3px solid; border-right: 3px solid; border-radius: 0 0 6px 0; }
+
+  .scanline {
+    position: absolute; left: 14%; right: 14%; top: 14%;
+    height: 2px; border-radius: 2px;
+    background: linear-gradient(90deg, transparent, var(--amber), transparent);
+    box-shadow: 0 0 8px 1px var(--amber);
+    animation: sweep 2.6s ease-in-out infinite;
+    opacity: 0.85;
+  }
+  @keyframes sweep {
+    0%   { top: 14%; opacity: 0; }
+    8%   { opacity: 0.85; }
+    50%  { top: 82%; opacity: 0.85; }
+    92%  { opacity: 0; }
+    100% { top: 82%; opacity: 0; }
+  }
+  .stage.paused .scanline { animation-play-state: paused; opacity: 0; }
+
+  .controls {
+    display: flex; align-items: center; gap: 10px;
+    margin-top: 16px; width: 100%; max-width: 420px;
+  }
+  .camsel {
+    flex: 1; background: var(--panel); color: var(--text);
+    border: 1px solid var(--line); border-radius: 10px;
+    font-family: var(--mono); font-size: 12px; padding: 10px 12px;
+    appearance: none;
+  }
+  .iconbtn {
+    background: var(--panel); border: 1px solid var(--line); color: var(--text);
+    width: 40px; height: 40px; border-radius: 10px; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer; transition: border-color 0.15s, color 0.15s;
+  }
+  .iconbtn:active { transform: scale(0.94); }
+  .iconbtn.active { border-color: var(--amber); color: var(--amber); }
+  .iconbtn svg { width: 18px; height: 18px; }
+  .iconbtn[disabled] { opacity: 0.35; pointer-events: none; }
+
+  .readout {
+    margin-top: 18px; width: 100%; max-width: 420px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    padding: 14px 16px; font-family: var(--mono); font-size: 13px;
+    display: flex; align-items: center; gap: 10px; min-height: 20px;
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; background: var(--text-dim); }
+  .readout.idle .dot { background: var(--amber); box-shadow: 0 0 6px var(--amber); animation: pulse 1.6s ease-in-out infinite; }
+  .readout.ok .dot { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+  .readout.err .dot { background: var(--err); box-shadow: 0 0 6px var(--err); }
+  .readout.ok { border-color: rgba(61,220,132,0.35); }
+  .readout.err { border-color: rgba(255,90,95,0.35); }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+
+  .footnote { margin-top: 14px; font-size: 11px; color: var(--text-dim); text-align: center; max-width: 320px; }
+
+  .manual {
+    display: flex; gap: 8px; width: 100%; max-width: 420px; margin-top: 12px;
+  }
+  .manualInput {
+    flex: 1; background: var(--panel); color: var(--text);
+    border: 1px solid var(--line); border-radius: 10px;
+    font-family: var(--mono); font-size: 13px; padding: 10px 12px;
+    letter-spacing: 0.02em;
+  }
+  .manualInput:focus { outline: none; border-color: var(--amber); }
+  .manualInput::placeholder { color: var(--text-dim); }
+  .manualBtn {
+    background: var(--amber); color: #14171a; border: none;
+    font-family: var(--sans); font-weight: 600; font-size: 13px;
+    border-radius: 10px; padding: 0 16px; cursor: pointer; flex-shrink: 0;
+  }
+  .manualBtn:active { transform: scale(0.96); }
+</style>
+</head>
+<body>
+  <div class="eyebrow">IT Inventory · Live</div>
+  <h1>Asset Scanner</h1>
+
+  <div class="stage" id="stage">
+    <div id="reader"></div>
+    <div class="brackets" id="brackets">
+      <span class="tl"></span><span class="tr"></span><span class="bl"></span><span class="br"></span>
+    </div>
+    <div class="scanline" id="scanline"></div>
+  </div>
+
+  <div class="controls">
+    <select class="camsel" id="camSelect"><option>Loading cameras…</option></select>
+    <button class="iconbtn" id="torchBtn" title="Toggle flashlight" disabled>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a6 6 0 0 0-6 6c0 2.4 1.2 3.8 2.2 5 .7.8 1.3 1.5 1.3 2.5h5c0-1 .6-1.7 1.3-2.5 1-1.2 2.2-2.6 2.2-5a6 6 0 0 0-6-6z"/></svg>
+    </button>
+  </div>
+
+  <div class="readout idle" id="readout">
+    <div class="dot"></div>
+    <div id="readoutText">Point the frame at an asset tag</div>
+  </div>
+
+  <div class="manual">
+    <input type="text" id="manualInput" class="manualInput" placeholder="Or type asset no. — e.g. T-000000" autocapitalize="characters" autocomplete="off">
+    <button class="manualBtn" id="manualBtn">Submit</button>
+  </div>
+
+  <div class="footnote">Works with any connected camera — use the dropdown above to switch between them.</div>
+
+  <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+  <script>
+    // ⬇⬇⬇ PASTE YOUR APPS SCRIPT WEB APP URL HERE ⬇⬇⬇
+    // Extensions > Apps Script > Deploy > Manage deployments > copy the "Web app" URL.
+    // It looks like: https://script.google.com/macros/s/AKfycb.../exec
+    var APPS_SCRIPT_URL = "PASTE_YOUR_APPS_SCRIPT_WEB_APP_URL_HERE";
+
+    var stageEl = document.getElementById('stage');
+    var bracketsEl = document.getElementById('brackets');
+    var readoutEl = document.getElementById('readout');
+    var readoutText = document.getElementById('readoutText');
+    var camSelect = document.getElementById('camSelect');
+    var torchBtn = document.getElementById('torchBtn');
+
+    var html5Qrcode = new Html5Qrcode("reader", /* verbose= */ false);
+    var isProcessing = false;
+    var torchOn = false;
+    var currentCameraId = null;
+
+    function setReadout(state, text) {
+      readoutEl.className = 'readout ' + state;
+      readoutText.innerText = text;
+    }
+
+    function setStagePaused(paused) {
+      stageEl.classList.toggle('paused', paused);
+      bracketsEl.classList.toggle('hit', paused && readoutEl.classList.contains('ok'));
+    }
+
+    function startCamera(cameraId) {
+      var config = { fps: 10, qrbox: { width: 240, height: 240 } };
+      html5Qrcode.start(cameraId, config, onScanSuccess, function () {})
+        .then(function () {
+          currentCameraId = cameraId;
+          setStagePaused(false);
+          checkTorchSupport();
+        })
+        .catch(function (err) {
+          setReadout('err', 'Camera error: ' + err);
+        });
+    }
+
+    function checkTorchSupport() {
+      try {
+        var capabilities = html5Qrcode.getRunningTrackCapabilities();
+        torchBtn.disabled = !capabilities || !capabilities.torch;
+      } catch (e) {
+        torchBtn.disabled = true;
+      }
+    }
+
+    torchBtn.addEventListener('click', function () {
+      torchOn = !torchOn;
+      html5Qrcode.applyVideoConstraints({ advanced: [{ torch: torchOn }] })
+        .then(function () { torchBtn.classList.toggle('active', torchOn); })
+        .catch(function () { torchOn = !torchOn; });
+    });
+
+    camSelect.addEventListener('change', function () {
+      var newId = camSelect.value;
+      if (newId === currentCameraId) return;
+      html5Qrcode.stop().then(function () {
+        html5Qrcode.clear();
+        startCamera(newId);
+      });
+    });
+
+    if (!APPS_SCRIPT_URL || APPS_SCRIPT_URL.indexOf('PASTE_YOUR') === 0) {
+      setReadout('err', 'Set APPS_SCRIPT_URL in the code before using this.');
+    }
+
+    Html5Qrcode.getCameras().then(function (cameras) {
+      camSelect.innerHTML = '';
+      if (!cameras || !cameras.length) {
+        camSelect.innerHTML = '<option>No camera found</option>';
+        setReadout('err', 'No camera found on this device.');
+        return;
+      }
+      cameras.forEach(function (cam, idx) {
+        var opt = document.createElement('option');
+        opt.value = cam.id;
+        opt.innerText = cam.label || ('Camera ' + (idx + 1));
+        camSelect.appendChild(opt);
+      });
+      // Prefer a back/rear camera by default if the label suggests it.
+      var back = cameras.find(function (c) { return /back|rear|environment/i.test(c.label); });
+      var startId = back ? back.id : cameras[0].id;
+      camSelect.value = startId;
+      startCamera(startId);
+    }).catch(function (err) {
+      setReadout('err', 'Camera permission needed — allow access and reload.');
+      camSelect.innerHTML = '<option>Permission denied</option>';
+    });
+
+    function onScanSuccess(decodedText) {
+      submitAssetId(decodedText, /* fromCamera= */ true);
+    }
+
+    var manualInput = document.getElementById('manualInput');
+    var manualBtn = document.getElementById('manualBtn');
+
+    function submitFromManualInput() {
+      var val = manualInput.value.trim();
+      if (!val) return;
+      submitAssetId(val, /* fromCamera= */ false);
+    }
+    manualBtn.addEventListener('click', submitFromManualInput);
+    manualInput.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter') submitFromManualInput();
+    });
+
+    function submitAssetId(assetId, fromCamera) {
+      if (isProcessing) return;
+      isProcessing = true;
+      if (fromCamera) setStagePaused(true);
+      manualBtn.disabled = true;
+      setReadout('idle', 'Scanned ' + assetId + ' — processing…');
+
+      fetch(APPS_SCRIPT_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({ assetId: assetId })
+      })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+          if (data.success) {
+            setReadout('ok', data.assetName + ' — now ' + data.newStatus);
+            bracketsEl.classList.add('hit');
+          } else {
+            setReadout('err', data.message);
+          }
+          setTimeout(function () {
+            setReadout('idle', 'Point the frame at an asset tag');
+            bracketsEl.classList.remove('hit');
+            isProcessing = false;
+            manualBtn.disabled = false;
+            manualInput.value = '';
+            if (fromCamera) setStagePaused(false);
+          }, 2200);
+        })
+        .catch(function (err) {
+          setReadout('err', 'Network error — check connection.');
+          setTimeout(function () {
+            isProcessing = false;
+            manualBtn.disabled = false;
+            if (fromCamera) setStagePaused(false);
+          }, 2200);
+        });
+    }
+  </script>
+</body>
+</html>
